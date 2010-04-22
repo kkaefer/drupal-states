@@ -22,7 +22,7 @@ Drupal.behaviors.states = {
         new states.Dependant({
           element: $(selector),
           state: states.State.sanitize(state),
-          dependees: settings.states[selector][state]
+          constraints: settings.states[selector][state]
         });
       }
     }
@@ -41,12 +41,14 @@ Drupal.behaviors.states = {
  *   Object with the following keys (all of which are required):
  *   - element: A jQuery object of the dependant element
  *   - state: A State object describing the state that is dependant
- *   - dependees: An object with dependency specifications. Lists all elements
- *     that this element depends on.
+ *   - constraints: An object with dependency specifications. Lists all elements
+ *     that this element depends on. It can be nested and contain arbitrary
+ *     AND and OR clauses.
  */
 states.Dependant = function (args) {
   $.extend(this, { values: {}, oldValue: undefined }, args);
 
+  this.dependees = this.getDependees();
   for (var selector in this.dependees) {
     this.initializeDependee(selector, this.dependees[selector]);
   }
@@ -83,16 +85,18 @@ states.Dependant.prototype = {
     // Cache for the states of this dependee.
     self.values[selector] = {};
 
-    $.each(dependeeStates, function (state, value) {
+    $.each(dependeeStates, function (i, state) {
+      // Make sure we're not initializing this selector/state combination twice.
+      if (dependeeStates.indexOf(state) < i) return;
+
       state = states.State.sanitize(state);
 
       // Initialize the value of this state.
-      self.values[selector][state.pristine] = undefined;
+      self.values[selector][state.name] = undefined;
 
       // Monitor state changes of the specified state for this dependee.
       $(selector).bind('state:' + state, function (e) {
-        var complies = self.compare(value, e.value);
-        self.update(selector, state, complies);
+        self.update(selector, state, e.value);
       });
 
       // Make sure the event we just bound ourselves to is actually fired.
@@ -108,9 +112,11 @@ states.Dependant.prototype = {
    * @param value
    *   The value to compare with the reference value.
    * @return
-   *   true, undefined or false.
+   *   true or false.
    */
-  compare: function (reference, value) {
+  compare: function (reference, selector, state) {
+    var value = this.values[selector][state.name];
+
     if (reference.constructor.name in states.Dependant.comparisons) {
       // Use a custom compare function for certain reference value types.
       return states.Dependant.comparisons[reference.constructor.name](reference, value);
@@ -133,8 +139,8 @@ states.Dependant.prototype = {
    */
   update: function (selector, state, value) {
     // Only act when the 'new' value is actually new.
-    if (value !== this.values[selector][state.pristine]) {
-      this.values[selector][state.pristine] = value;
+    if (value !== this.values[selector][state.name]) {
+      this.values[selector][state.name] = value;
       this.reevaluate();
     }
   },
@@ -143,16 +149,8 @@ states.Dependant.prototype = {
    * Triggers change events in case a state changed.
    */
   reevaluate: function () {
-    var value = undefined;
-
-    // Merge all individual values to find out whether this dependee complies.
-    for (var selector in this.values) {
-      for (var state in this.values[selector]) {
-        state = states.State.sanitize(state);
-        var complies = this.values[selector][state.pristine];
-        value = ternary(value, invert(complies, state.invert));
-      }
-    }
+    // Check whether any constraint for this dependant/state is satisifed.
+    var value = this.verifyConstraints(this.constraints);
 
     // Only invoke a state change event when the value actually changed.
     if (value !== this.oldValue) {
@@ -167,6 +165,113 @@ states.Dependant.prototype = {
       // infinite loops.
       this.element.trigger({ type: 'state:' + this.state, value: value, trigger: true });
     }
+  },
+
+  /**
+   * Checks whether a constraint is satisified by evaluating the appropriate
+   * child constraints.
+   *
+   * @param constraints
+   *   An object or an array of constraints.
+   * @param selector
+   *   The selector for these constraints. If undefined, there isn't yet a
+   *   selector that these constraints apply to. In that case, the keys of the
+   *   object are interpreted as the selector if encountered.
+   * @return
+   *   true or false, depending on whether these constraints are
+   *   satisfied.
+   */
+  verifyConstraints: function(constraints, selector) {
+    var result = undefined;
+    if ($.isArray(constraints)) {
+      // This constraint is an array (OR or XOR).
+      var or = constraints.indexOf('xor') < 0;
+      for (var i = 0, len = constraints.length; i < len; i++) {
+        var constraint = this.checkConstraints(constraints[i], selector, i);
+        // Return if this is OR and we have a satisfied constraint or if this is
+        // XOR and we have a second satisfied constraint.
+        if (constraint && (or || result)) return or;
+        result = result || constraint;
+      }
+    }
+    // Make sure we don't try to iterate over things other than objects. This
+    // shouldn't normally occur, but in case the condition definition is bogus,
+    // we don't want to end up with an infinite loop.
+    else if (constraints.constructor === Object) {
+      // This constraint is an object (AND).
+      for (var i in constraints) {
+        result = ternary(result, this.checkConstraints(constraints[i], selector, i));
+        if (result === false) return false; // Optimization; result can't get falser anyway.
+      }
+    }
+    return result;
+  },
+
+  /**
+   * Check whether the value matches the requirements for this constraint.
+   *
+   * @param value
+   *   Either the value of a state or an array/object of constraints. In the
+   *   latter case, resolving the constraint continues.
+   * @param selector
+   *   The selector for this constraint. If undefined, there isn't yet a
+   *   selector that this constraint applies to. In that case, the state key is
+   *   propagates to a selector and resolving continues.
+   * @param state
+   *   The state to check for this constraint. If undefined, resolving continues.
+   *   If both selector and state aren't undefined and valid non-numeric strings,
+   *   a lookup for the actual value of that selector's state is performed.
+   *   state is /not/ a State object but a pristine state string.
+   * @return
+   *   true or false, depending on whether this constraint is satisfied.
+   */
+  checkConstraints: function(value, selector, state) {
+    // Normalize the last parameter. If it's non-numeric, we treat it either as a
+    // selector (in case there isn't one yet) or as a trigger/state.
+    if (typeof state != 'string' || (/[0-9]/).test(state[0])) {
+      state = undefined;
+    }
+    else if (selector === undefined) {
+      // Propagate the state to the selector when there isn't one yet.
+      selector = state;
+      state = undefined;
+    }
+
+    if (state !== undefined) {
+      // constraints is the actual constraints of an element to check for.
+      state = states.State.sanitize(state);
+      return invert(this.compare(value, selector, state), state.invert);
+    }
+    else {
+      // Resolve this constraint as an AND/OR operator.
+      return this.verifyConstraints(value, selector);
+    }
+  },
+
+  /**
+   * Reuse the verify function to gather information about all required triggers.
+   */
+  getDependees: function() {
+    var cache = {};
+    // Swivel the lookup function so that we can record all available selector-
+    // state combinations for initialization.
+    var _compare = this.compare;
+    this.compare = function(reference, selector, state) {
+      (cache[selector] || (cache[selector] = [])).push(state.name);
+      // Return nothing (=== undefined) so that the constraint loops are not broken.
+    };
+
+    // This call doesn't actually /verify/ anything but uses the resolving
+    // mechanism to go through the constraints array, trying to "lookup" each
+    // value. Since we swivelled the compare function, this comparison returns
+    // undefined and lookup continues until the very end. Instead of lookup up
+    // the value, we record that combination of selector and state so that we
+    // can initialize all triggers.
+    this.verifyConstraints(this.constraints);
+    // Restore the original function.
+    this.compare = _compare;
+
+    return cache;
   }
 };
 
