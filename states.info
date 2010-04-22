@@ -1,0 +1,5 @@
+; $Id$
+name = States
+description = "Extension of the #states system"
+core = 7.x
+files[] = states.module

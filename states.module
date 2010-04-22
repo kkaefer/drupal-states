@@ -1,0 +1,18 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * This module replaces the built-in states.js with a more complete version of
+ * it to enable more complex dependencies.
+ */
+
+function states_preprocess_html(&$variables) {
+  $js = &drupal_static('drupal_add_js', array());
+  if (isset($js['misc/states.js'])) {
+    $path = drupal_get_path('module', 'states') . '/states.js';
+    $js[$path] = $js['misc/states.js'];
+    $js[$path]['data'] = $path;
+    unset($js['misc/states.js']);
+  }
+}
